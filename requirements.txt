@@ -3,3 +3,5 @@ scipy
 scikit-learn
 plotly
 pandas
+sgp4
+request
