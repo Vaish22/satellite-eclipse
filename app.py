@@ -28,7 +28,6 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 import time
 from datetime import datetime, timezone
-from streamlit_autorefresh import st_autorefresh
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -696,172 +695,364 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 with tab1:
-    # ── Real-time tracking + manual animation ─────────────────────────
-    if "anim_playing" not in st.session_state:
-        st.session_state.anim_playing = False
-    if "anim_frame" not in st.session_state:
-        st.session_state.anim_frame = 0
-    if "tracking_mode" not in st.session_state:
-        st.session_state.tracking_mode = "realtime"
+    import streamlit.components.v1 as components
 
-    # ── Mode toggle ───────────────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.2, 1, 1, 1, 3])
-    with ctrl1:
-        mode_btn = st.button(
-            "🌍 LIVE" if st.session_state.tracking_mode == "realtime" else "🎬 SIMULATE",
-            use_container_width=True,
-            help="Toggle between real-time position and manual animation"
-        )
-        if mode_btn:
-            st.session_state.tracking_mode = "simulate" if st.session_state.tracking_mode == "realtime" else "realtime"
-            st.session_state.anim_playing = False
-            st.rerun()
+    # Pass orbital data to JS as JSON
+    import json
 
-    if st.session_state.tracking_mode == "simulate":
-        with ctrl2:
-            if st.button("▶ Play" if not st.session_state.anim_playing else "⏸ Pause", use_container_width=True):
-                st.session_state.anim_playing = not st.session_state.anim_playing
-                if st.session_state.anim_playing and st.session_state.anim_frame >= len(positions) - 1:
-                    st.session_state.anim_frame = 0
-        with ctrl3:
-            if st.button("⏹ Reset", use_container_width=True):
-                st.session_state.anim_playing = False
-                st.session_state.anim_frame = 0
-                st.rerun()
-        with ctrl4:
-            speed = st.selectbox("Speed", ["1x", "2x", "4x", "8x"], index=1, label_visibility="collapsed")
-            step = {"1x": 2, "2x": 4, "4x": 8, "8x": 16}[speed]
+    # Serialize positions, ef, sun_pos, times for JS
+    # Downsample to 500 points max for performance
+    ds = max(1, len(positions) // 500)
+    pos_js  = positions[::ds, :2].tolist()   # only x,y
+    ef_js   = ef[::ds].tolist()
+    t_js    = times[::ds].tolist()
+    bat_js  = battery_series[::ds]
+    sun_js  = sun_pos[0, :2].tolist()        # sun direction (fixed for this sim)
 
-    # ── Compute current frame ─────────────────────────────────────────
-    if st.session_state.tracking_mode == "realtime":
-        # Use actual UTC time to compute where satellite is RIGHT NOW
-        # J2000 epoch = Jan 1 2000 12:00:00 UTC
-        J2000 = datetime(2000, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        now_utc = datetime.now(timezone.utc)
-        elapsed_seconds = (now_utc - J2000).total_seconds()
+    orbit_data = {
+        "positions": pos_js,
+        "ef": ef_js,
+        "times": t_js,
+        "battery": bat_js,
+        "T": float(T),
+        "body": m["body"],
+        "a": float(m["a"]),
+        "color": color,
+        "battery_start": float(m["battery_start"]),
+        "sun": sun_js,
+        "R_body": float(R_BODY[m["body"]]),
+        "mission": mission_name.split("—")[0].strip(),
+        "mean_eclipse": float(mean_eclipse),
+        "eclipse_frac": float(eclipse_frac),
+        "n_events": len(events),
+        "ai_pred": float(pred[0]),
+        "period_min": float(T/60),
+    }
 
-        # How many complete seconds into current orbit?
-        orbit_seconds = elapsed_seconds % T  # T = orbital period in seconds
-        # Find closest frame index
-        frame_seconds = times  # times array in seconds
-        f = int(np.searchsorted(frame_seconds, orbit_seconds))
-        f = min(f, len(positions) - 1)
-        st.session_state.anim_frame = f
+    html_code = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * {{ margin:0; padding:0; box-sizing:border-box; }}
+  body {{ background:#080c12; font-family:'Courier New',monospace; color:#8b949e; overflow:hidden; }}
+  #wrap {{ display:flex; gap:0; width:100%; height:520px; }}
+  #canvasWrap {{ flex:1; position:relative; }}
+  canvas {{ display:block; width:100%; height:100%; }}
+  #panel {{ width:220px; background:#0d1117; border-left:1px solid #1c2333; padding:16px 12px; display:flex; flex-direction:column; gap:10px; overflow:hidden; }}
+  .label {{ font-size:9px; color:#445; letter-spacing:2px; margin-bottom:3px; }}
+  .value {{ font-size:16px; font-weight:bold; color:#00d4ff; }}
+  .subval {{ font-size:10px; color:#445; margin-top:1px; }}
+  .divider {{ border-top:1px solid #1c2333; margin:2px 0; }}
+  .mode-badge {{ font-size:11px; font-weight:bold; padding:4px 10px; border-radius:3px; display:inline-block; margin-top:2px; }}
+  .bat-bar-wrap {{ height:10px; background:#1c2333; border-radius:5px; overflow:hidden; margin-top:4px; }}
+  .bat-bar {{ height:100%; border-radius:5px; transition:width 0.5s, background 0.5s; }}
+  #clock {{ font-size:10px; color:#445; margin-top:2px; }}
+  #nextEclipse {{ font-size:11px; color:#e3b341; }}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="canvasWrap"><canvas id="c"></canvas></div>
+  <div id="panel">
+    <div>
+      <div class="label">MISSION</div>
+      <div class="value" style="font-size:13px;" id="missionName"></div>
+    </div>
+    <div class="divider"></div>
+    <div>
+      <div class="label">UTC TIME</div>
+      <div id="clock">--</div>
+    </div>
+    <div>
+      <div class="label">ORBIT POSITION</div>
+      <div class="value" id="tVal">--</div>
+      <div class="subval" id="orbitNum">--</div>
+    </div>
+    <div class="divider"></div>
+    <div>
+      <div class="label">CURRENT MODE</div>
+      <div id="modeBadge" class="mode-badge">--</div>
+    </div>
+    <div>
+      <div class="label">NEXT ECLIPSE</div>
+      <div id="nextEclipse">--</div>
+    </div>
+    <div class="divider"></div>
+    <div>
+      <div class="label">BATTERY</div>
+      <div class="value" id="batVal">--</div>
+      <div class="bat-bar-wrap"><div class="bat-bar" id="batBar"></div></div>
+    </div>
+    <div>
+      <div class="label">SOLAR POWER</div>
+      <div class="value" id="solarVal">--</div>
+      <div class="subval" id="netPower">--</div>
+    </div>
+    <div class="divider"></div>
+    <div>
+      <div class="label">ECLIPSE STATS</div>
+      <div class="subval">Mean: <span id="meanEcl" style="color:#00d4ff;"></span> min</div>
+      <div class="subval">Fraction: <span id="eclFrac" style="color:#00d4ff;"></span>%</div>
+      <div class="subval">Events: <span id="nEvents" style="color:#00d4ff;"></span></div>
+      <div class="subval">AI pred: <span id="aiPred" style="color:#a371f7;"></span> min</div>
+    </div>
+  </div>
+</div>
 
-        # Smooth auto-refresh every 5 seconds — no blink
-        st_autorefresh(interval=5000, limit=None, key="live_refresh")
+<script>
+const DATA = {json.dumps(orbit_data)};
 
-    else:
-        # Simulate mode — start from real current position, animate forward
-        # On first entry into simulate mode, sync frame to real-time position
-        if "simulate_start_synced" not in st.session_state or st.session_state.get("last_mission") != mission_name:
-            J2000 = datetime(2000, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-            now_utc_s = datetime.now(timezone.utc)
-            elapsed_s = (now_utc_s - J2000).total_seconds()
-            orbit_s   = elapsed_s % T
-            sync_f    = int(np.searchsorted(times, orbit_s))
-            sync_f    = min(sync_f, len(positions) - 1)
-            st.session_state.anim_frame = sync_f
-            st.session_state.simulate_start_synced = True
+// ── Pre-process ────────────────────────────────────────────────────
+const pos   = DATA.positions;
+const ef    = DATA.ef;
+const times = DATA.times;
+const bat   = DATA.battery;
+const T     = DATA.T;          // orbital period in seconds
+const color = DATA.color;
+const Rb    = DATA.R_body;
+const sunDir = DATA.sun;
+const N     = pos.length;
 
-        frame_idx = st.slider("Mission Time", 0, len(positions)-1,
-                              st.session_state.anim_frame, label_visibility="collapsed")
-        if frame_idx != st.session_state.anim_frame and not st.session_state.anim_playing:
-            st.session_state.anim_frame = frame_idx
+// Normalise all positions for canvas
+const maxR  = Math.max(...pos.map(p => Math.sqrt(p[0]*p[0]+p[1]*p[1])));
 
-        if st.session_state.anim_playing:
-            next_frame = st.session_state.anim_frame + step
-            if next_frame >= len(positions):
-                # Loop back to beginning of orbit (wrap around)
-                next_frame = next_frame % len(positions)
-            st.session_state.anim_frame = next_frame
-            time.sleep(0.05)
-            st.rerun()
+// ── Canvas setup ──────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
 
-    # ── Current frame info ────────────────────────────────────────────
-    f    = st.session_state.anim_frame
-    frac = max(1, f)
-    current_ef        = ef[f]
-    current_mode_anim = "UMBRA" if current_ef >= 1 else "PENUMBRA" if current_ef > 0 else "SUNLIT"
-    mode_col_anim     = "#f85149" if current_mode_anim=="UMBRA" else "#e3b341" if current_mode_anim=="PENUMBRA" else "#3fb950"
+function resize() {{
+  const wrap = document.getElementById('canvasWrap');
+  canvas.width  = wrap.clientWidth  * window.devicePixelRatio;
+  canvas.height = wrap.clientHeight * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+}}
+window.addEventListener('resize', resize);
+resize();
 
-    t_now_min = times[f] / 60
-    T_min     = T / 60
-    orbit_num = int(t_now_min / T_min) + 1
+function cx() {{ return canvas.width  / window.devicePixelRatio / 2; }}
+function cy() {{ return canvas.height / window.devicePixelRatio / 2; }}
+function scale() {{ return Math.min(cx(), cy()) * 0.82; }}
 
-    # Real UTC clock
-    now_utc   = datetime.now(timezone.utc)
-    utc_str   = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+function toScreen(x, y) {{
+  const s = scale() / maxR;
+  return [cx() + x * s, cy() - y * s];
+}}
 
-    # Find time until next eclipse from current frame
-    next_eclipse_str = "—"
-    if current_ef == 0:
-        for k in range(f, len(ef)):
-            if ef[k] > 0:
-                mins_until = (times[k] - times[f]) / 60
-                next_eclipse_str = f"{mins_until:.1f} min"
-                break
-    else:
-        # Already in eclipse — find time until exit
-        for k in range(f, len(ef)):
-            if ef[k] == 0:
-                mins_exit = (times[k] - times[f]) / 60
-                next_eclipse_str = f"exits in {mins_exit:.1f} min"
-                break
+// ── J2000 epoch ───────────────────────────────────────────────────
+const J2000 = Date.UTC(2000, 0, 1, 12, 0, 0);
 
-    mode_label = "🌍 LIVE POSITION" if st.session_state.tracking_mode == "realtime" else "🎬 SIMULATION"
-    st.markdown(
-        f"<div style='font-family:monospace;font-size:11px;color:#445;margin-bottom:6px;display:flex;gap:20px;'>"
-        f"<span style='color:#00d4ff;font-weight:bold;'>{mode_label}</span>"
-        f"<span>🕐 {utc_str}</span>"
-        f"<span>Orbit pos: <b style='color:#00d4ff;'>{t_now_min:.1f} min / {T_min:.1f} min</b></span>"
-        f"<span>Mode: <b style='color:{mode_col_anim};'>{current_mode_anim}</b></span>"
-        f"<span>Next eclipse: <b style='color:#e3b341;'>{next_eclipse_str}</b></span>"
-        f"</div>", unsafe_allow_html=True)
+function getCurrentFrame() {{
+  const now    = Date.now();
+  const elapsed = (now - J2000) / 1000;   // seconds since J2000
+  const orbit_t = elapsed % T;             // position within current orbit (seconds)
+  // Binary search for closest frame
+  let lo = 0, hi = N - 1;
+  while (lo < hi) {{
+    const mid = (lo + hi) >> 1;
+    if (times[mid] < orbit_t) lo = mid + 1;
+    else hi = mid;
+  }}
+  return Math.min(lo, N - 1);
+}}
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        # In live mode: show full orbit as faint trail + bright dot at real position
-        # In simulate mode: draw orbit up to current frame
-        if st.session_state.tracking_mode == "realtime":
-            st.plotly_chart(
-                plot_orbit_2d(positions, ef, sun_pos, m, color, highlight_frame=f),
-                use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.plotly_chart(
-                plot_orbit_2d(positions[:frac], ef[:frac], sun_pos, m, color, highlight_frame=None),
-                use_container_width=True, config={"displayModeBar": False})
-    with col2:
-        st.markdown(f"<div style='font-family:monospace;font-size:9px;color:#445;letter-spacing:2px;margin-bottom:10px;'>ECLIPSE STATISTICS</div>", unsafe_allow_html=True)
-        stats = [
-            ("Eclipse Events", len(events), ""),
-            ("Mean Duration", f"{mean_eclipse:.1f}", "min"),
-            ("Max Duration",  f"{max_eclipse:.1f}", "min"),
-            ("Eclipse Fraction", f"{eclipse_frac:.1f}", "%"),
-            ("Eclipses/Orbit", f"{len(events)/n_orbits:.2f}", ""),
-        ]
-        for label, val, unit in stats:
-            st.markdown(f"""
-            <div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1c2333;'>
-              <span style='font-family:monospace;font-size:10px;color:#556;'>{label}</span>
-              <span style='font-family:monospace;font-size:11px;color:{color};'>{val} <span style='color:#334;font-size:9px;'>{unit}</span></span>
-            </div>""", unsafe_allow_html=True)
+// ── Battery simulation — run in real time ────────────────────────
+// Recompute battery from frame 0 up to current frame each tick
+// (fast since N<=500)
+function getBattery(frameIdx) {{
+  return bat[frameIdx];
+}}
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown(f"<div style='font-family:monospace;font-size:9px;color:#445;letter-spacing:2px;margin-bottom:10px;'>AI PREDICTION</div>", unsafe_allow_html=True)
-        ai_stats = [
-            ("Mean Eclipse (AI)", f"{pred[0]:.1f}", "min"),
-            ("Eclipses/Orbit (AI)", f"{pred[1]:.2f}", ""),
-            ("Max Eclipse (AI)", f"{pred[2]:.1f}", "min"),
-            ("Model", best_model_name, ""),
-            ("Mean R²", f"{model_results[best_model_name]['mean_r2']:.3f}", ""),
-        ]
-        for label, val, unit in ai_stats:
-            st.markdown(f"""
-            <div style='display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1c2333;'>
-              <span style='font-family:monospace;font-size:10px;color:#556;'>{label}</span>
-              <span style='font-family:monospace;font-size:11px;color:#a371f7;'>{val} <span style='color:#334;font-size:9px;'>{unit}</span></span>
-            </div>""", unsafe_allow_html=True)
+// ── Draw ──────────────────────────────────────────────────────────
+function hexToRgb(hex) {{
+  const r = parseInt(hex.slice(1,3),16);
+  const g = parseInt(hex.slice(3,5),16);
+  const b = parseInt(hex.slice(5,7),16);
+  return `${{r}},${{g}},${{b}}`;
+}}
+
+function draw() {{
+  const W = canvas.width  / window.devicePixelRatio;
+  const H = canvas.height / window.devicePixelRatio;
+  ctx.clearRect(0, 0, W, H);
+
+  const f = getCurrentFrame();
+
+  // ── Background stars ─────────────────────────────────────────
+  ctx.fillStyle = '#080c12';
+  ctx.fillRect(0, 0, W, H);
+  // Static stars (seeded)
+  const starSeed = 42;
+  for (let i = 0; i < 120; i++) {{
+    const sx = ((Math.sin(i * 127.1 + starSeed) * 0.5 + 0.5)) * W;
+    const sy = ((Math.sin(i * 311.7 + starSeed) * 0.5 + 0.5)) * H;
+    const sr = 0.5 + (Math.sin(i * 74.3) * 0.5 + 0.5) * 1.0;
+    const sa = 0.3 + (Math.sin(i * 53.1) * 0.5 + 0.5) * 0.5;
+    ctx.beginPath();
+    ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,255,255,${{sa}})`;
+    ctx.fill();
+  }}
+
+  // ── Sun direction & rays ──────────────────────────────────────
+  const sunMag  = Math.sqrt(sunDir[0]**2 + sunDir[1]**2);
+  const sunNorm = [sunDir[0]/sunMag, sunDir[1]/sunMag];
+  const sunDist = scale() * 1.35;
+  const [sx, sy] = [cx() + sunNorm[0]*sunDist, cy() - sunNorm[1]*sunDist];
+
+  // Sun glow
+  const grd = ctx.createRadialGradient(sx, sy, 2, sx, sy, 40);
+  grd.addColorStop(0, 'rgba(255,220,50,0.9)');
+  grd.addColorStop(0.3, 'rgba(255,180,30,0.4)');
+  grd.addColorStop(1, 'rgba(255,150,0,0)');
+  ctx.beginPath(); ctx.arc(sx, sy, 40, 0, Math.PI*2);
+  ctx.fillStyle = grd; ctx.fill();
+  ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI*2);
+  ctx.fillStyle = '#ffd700'; ctx.fill();
+
+  // Shadow cone
+  const shadowLen = scale() * 2.2;
+  const perpX =  sunNorm[1];
+  const perpY = -sunNorm[0];
+  const shadowW = (Rb / maxR) * scale() * 1.1;
+  const [ox, oy] = toScreen(0, 0);
+  ctx.beginPath();
+  ctx.moveTo(ox + perpX*shadowW, oy + perpY*shadowW);
+  ctx.lineTo(ox - sunNorm[0]*shadowLen, oy + sunNorm[1]*shadowLen);
+  ctx.lineTo(ox - perpX*shadowW, oy - perpY*shadowW);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fill();
+
+  // ── Planet ────────────────────────────────────────────────────
+  const pR = (Rb / maxR) * scale();
+  const bodyColors = {{Earth:'#2a6099', Mars:'#c0622a', Moon:'#555'}};
+  const bColor = bodyColors[DATA.body] || '#2a6099';
+  const grad = ctx.createRadialGradient(cx()-pR*0.3, cy()-pR*0.3, pR*0.1, cx(), cy(), pR);
+  grad.addColorStop(0, bColor);
+  grad.addColorStop(1, '#0a0f18');
+  ctx.beginPath(); ctx.arc(cx(), cy(), pR, 0, Math.PI*2);
+  ctx.fillStyle = grad; ctx.fill();
+  ctx.strokeStyle = bColor + '66'; ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // ── Full orbit trail (faint) ──────────────────────────────────
+  ctx.beginPath();
+  for (let i = 0; i < N; i++) {{
+    const [px, py] = toScreen(pos[i][0], pos[i][1]);
+    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  }}
+  ctx.strokeStyle = `rgba(${{hexToRgb(color)}},0.12)`;
+  ctx.lineWidth = 1; ctx.stroke();
+
+  // ── Coloured orbit arc up to current frame ────────────────────
+  for (let i = 1; i <= f; i++) {{
+    const [x1, y1] = toScreen(pos[i-1][0], pos[i-1][1]);
+    const [x2, y2] = toScreen(pos[i][0],   pos[i][1]);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    if      (ef[i] >= 1)  ctx.strokeStyle = 'rgba(248,81,73,0.7)';
+    else if (ef[i] > 0)   ctx.strokeStyle = 'rgba(227,179,65,0.7)';
+    else                  ctx.strokeStyle = `rgba(${{hexToRgb(color)}},0.55)`;
+    ctx.lineWidth = 1.8; ctx.stroke();
+  }}
+
+  // ── Satellite ─────────────────────────────────────────────────
+  const [satX, satY] = toScreen(pos[f][0], pos[f][1]);
+  const inEclipse = ef[f] >= 1;
+  const inPenum   = ef[f] > 0 && ef[f] < 1;
+  const satCol    = inEclipse ? '#f85149' : inPenum ? '#e3b341' : color;
+
+  // Pulse ring
+  const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 400);
+  ctx.beginPath(); ctx.arc(satX, satY, 10 + pulse*5, 0, Math.PI*2);
+  ctx.strokeStyle = satCol + '55'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // Satellite body
+  ctx.save();
+  ctx.translate(satX, satY);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = satCol;
+  ctx.fillRect(-5, -5, 10, 10);
+  // Solar panels
+  ctx.fillStyle = inEclipse ? '#333' : '#4a9eff';
+  ctx.fillRect(-14, -2, 8, 4);
+  ctx.fillRect(6, -2, 8, 4);
+  ctx.restore();
+
+  // ── Update panel ──────────────────────────────────────────────
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toUTCString().replace('GMT','UTC');
+  document.getElementById('missionName').textContent = DATA.mission;
+
+  const tMin   = times[f] / 60;
+  const tTotal = T / 60;
+  const orbitN = Math.floor(tMin / tTotal) + 1;
+  document.getElementById('tVal').textContent =
+    tMin.toFixed(1) + ' / ' + tTotal.toFixed(1) + ' min';
+  document.getElementById('orbitNum').textContent = 'Orbit ' + orbitN;
+
+  const mode      = inEclipse ? 'UMBRA' : inPenum ? 'PENUMBRA' : 'SUNLIT';
+  const modeColor = inEclipse ? '#f85149' : inPenum ? '#e3b341' : '#3fb950';
+  const badge     = document.getElementById('modeBadge');
+  badge.textContent = '● ' + mode;
+  badge.style.color      = modeColor;
+  badge.style.background = modeColor + '18';
+  badge.style.border     = '1px solid ' + modeColor + '44';
+
+  // Next eclipse countdown
+  let nextStr = '—';
+  if (!inEclipse && !inPenum) {{
+    for (let k = f; k < N; k++) {{
+      if (ef[k] > 0) {{
+        const mins = (times[k] - times[f]) / 60;
+        nextStr = 'in ' + mins.toFixed(1) + ' min';
+        break;
+      }}
+    }}
+  }} else {{
+    for (let k = f; k < N; k++) {{
+      if (ef[k] === 0) {{
+        const mins = (times[k] - times[f]) / 60;
+        nextStr = 'exits in ' + mins.toFixed(1) + ' min';
+        break;
+      }}
+    }}
+  }}
+  document.getElementById('nextEclipse').textContent = nextStr;
+
+  // Battery
+  const b      = getBattery(f);
+  const bColor2 = b < 25 ? '#f85149' : b < 50 ? '#e3b341' : '#3fb950';
+  document.getElementById('batVal').textContent = b.toFixed(1) + '%';
+  document.getElementById('batBar').style.width      = b + '%';
+  document.getElementById('batBar').style.background = bColor2;
+
+  // Solar
+  const solar = inEclipse || inPenum ? 0 : 500;
+  const draw2  = inEclipse || inPenum ? 150 : 300;
+  const net    = solar - draw2;
+  document.getElementById('solarVal').textContent = solar + 'W';
+  document.getElementById('solarVal').style.color = solar > 0 ? '#e3b341' : '#f85149';
+  document.getElementById('netPower').textContent = 'Net: ' + (net >= 0 ? '+' : '') + net + 'W';
+
+  // Static stats
+  document.getElementById('meanEcl').textContent = DATA.mean_eclipse.toFixed(1);
+  document.getElementById('eclFrac').textContent  = DATA.eclipse_frac.toFixed(1);
+  document.getElementById('nEvents').textContent  = DATA.n_events;
+  document.getElementById('aiPred').textContent   = DATA.ai_pred.toFixed(1);
+
+  requestAnimationFrame(draw);
+}}
+
+draw();
+</script>
+</body>
+</html>
+"""
+
+    components.html(html_code, height=520, scrolling=False)
 
 with tab2:
     st.plotly_chart(plot_eclipse_timeline(times, ef, events, color),
