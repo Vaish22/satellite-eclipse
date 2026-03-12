@@ -3,4 +3,3 @@ scipy
 scikit-learn
 plotly
 pandas
-streamlit-autorefresh
