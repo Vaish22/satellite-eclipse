@@ -331,7 +331,7 @@ def plot_orbit_2d(positions, ef, sun_pos, m, color):
             sunlit_x.append(pos_Mm[i,0]); sunlit_y.append(pos_Mm[i,1])
 
     fig.add_trace(go.Scatter(x=sunlit_x, y=sunlit_y, mode="markers",
-        marker=dict(size=2, color=color+"88"), name="Sunlit", hoverinfo="skip"))
+        marker=dict(size=2, color=color, opacity=0.4), name="Sunlit", hoverinfo="skip"))
     if penum_x:
         fig.add_trace(go.Scatter(x=penum_x, y=penum_y, mode="markers",
             marker=dict(size=3, color="#e3b341"), name="Penumbra", hoverinfo="skip"))
