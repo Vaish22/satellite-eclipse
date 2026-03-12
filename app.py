@@ -577,6 +577,22 @@ if "sim_results" not in st.session_state or run_btn or st.session_state.get("las
 
 times, positions, sun_pos, ef, T, events = st.session_state.sim_results
 
+# ─── Pre-compute battery for every frame ─────────────────────────────────────
+def compute_battery(times, ef, battery_start):
+    battery = [battery_start]
+    for i in range(1, len(times)):
+        in_e = ef[i] > 0
+        sol  = 0 if in_e else 500
+        drw  = 150 if in_e else 300
+        dt   = (times[i] - times[i-1]) / 3600
+        bat  = min(100, max(0, battery[-1] + (sol - drw) * dt / 100))
+        battery.append(bat)
+    return battery
+
+if "battery_series" not in st.session_state or st.session_state.get("last_mission") != mission_name:
+    st.session_state.battery_series = compute_battery(times, ef, m["battery_start"])
+battery_series = st.session_state.battery_series
+
 # ─── Train AI model ───────────────────────────────────────────────────────────
 with st.spinner("Loading AI model (first run takes ~30 seconds)..."):
     model_results, best_model_name = train_model()
@@ -593,21 +609,53 @@ eclipse_frac    = np.sum(ef > 0) / len(ef) * 100
 current_mode    = "UMBRA" if ef[-1] >= 1 else "PENUMBRA" if ef[-1] > 0 else "SUNLIT"
 mode_color      = "#f85149" if current_mode=="UMBRA" else "#e3b341" if current_mode=="PENUMBRA" else "#3fb950"
 
-# ─── Metric Row ───────────────────────────────────────────────────────────────
+# ─── Live metrics driven by animation frame ───────────────────────────────────
+live_frame   = st.session_state.get("anim_frame", 0)
+live_ef      = ef[live_frame]
+live_battery = battery_series[live_frame]
+live_t_min   = times[live_frame] / 60
+live_mode    = "UMBRA" if live_ef >= 1 else "PENUMBRA" if live_ef > 0 else "SUNLIT"
+live_color   = "#f85149" if live_mode=="UMBRA" else "#e3b341" if live_mode=="PENUMBRA" else "#3fb950"
+live_solar   = 0 if live_ef > 0 else 500
+live_draw    = 150 if live_ef > 0 else 300
+live_net     = live_solar - live_draw
+bat_delta    = f"{live_battery - m['battery_start']:+.1f}% from start"
+bat_color    = "#f85149" if live_battery < 25 else "#e3b341" if live_battery < 50 else "#3fb950"
+
+# Eclipse countdown — find next eclipse start from current frame
+next_eclipse_min = None
+for k in range(live_frame, len(ef)):
+    if ef[k] > 0 and (live_frame == 0 or ef[live_frame] == 0):
+        next_eclipse_min = (times[k] - times[live_frame]) / 60
+        break
+
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 with c1: st.metric("ALTITUDE", f"{(m['a']-Rb)/1e3:.0f} km")
-with c2: st.metric("PERIOD", f"{T/60:.1f} min")
-with c3: st.metric("ECLIPSE %", f"{eclipse_frac:.1f}%")
-with c4: st.metric("MEAN ECLIPSE", f"{mean_eclipse:.1f} min")
+with c2: st.metric("MISSION TIME", f"{live_t_min:.1f} min")
+with c3:
+    st.markdown(f"""<div data-testid="metric-container" style="background:linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01));border:1px solid #1c2333;border-radius:6px;padding:12px 16px;">
+    <label style="color:#556;font-family:monospace;font-size:11px;letter-spacing:2px;">BATTERY</label>
+    <div style="font-family:monospace;font-size:28px;font-weight:bold;color:{bat_color};">{live_battery:.1f}%</div>
+    <div style="font-family:monospace;font-size:11px;color:#445;">{bat_delta}</div>
+    </div>""", unsafe_allow_html=True)
+with c4:
+    st.markdown(f"""<div data-testid="metric-container" style="background:linear-gradient(135deg,rgba(255,255,255,0.04),rgba(255,255,255,0.01));border:1px solid #1c2333;border-radius:6px;padding:12px 16px;">
+    <label style="color:#556;font-family:monospace;font-size:11px;letter-spacing:2px;">SOLAR POWER</label>
+    <div style="font-family:monospace;font-size:28px;font-weight:bold;color:{'#e3b341' if live_solar>0 else '#f85149'};">{live_solar}W</div>
+    <div style="font-family:monospace;font-size:11px;color:#445;">Net: {live_net:+d}W</div>
+    </div>""", unsafe_allow_html=True)
 with c5: st.metric("AI PREDICTED", f"{pred[0]:.1f} min", delta=f"{pred[0]-mean_eclipse:+.1f} vs physics")
 with c6: st.metric("EVENTS", f"{len(events)}", f"in {n_orbits} orbits")
 
 st.markdown(f"""
 <div style='display:flex; align-items:center; gap:8px; margin:8px 0 16px 0;'>
   <span style='font-family:monospace; font-size:11px; color:#445;'>Current mode:</span>
-  <span style='font-family:monospace; font-size:12px; font-weight:bold; color:{mode_color};
-    background:{mode_color}18; padding:3px 12px; border-radius:3px; border:1px solid {mode_color}44;'>
-    ● {current_mode}
+  <span style='font-family:monospace; font-size:12px; font-weight:bold; color:{live_color};
+    background:{live_color}18; padding:3px 12px; border-radius:3px; border:{live_color}44 1px solid;'>
+    ● {live_mode}
+  </span>
+  <span style='font-family:monospace;font-size:11px;color:#445;margin-left:8px;'>
+    Draw: {live_draw}W
   </span>
   <span style='font-family:monospace; font-size:10px; color:#445; margin-left:8px;'>
     Best AI Model: {best_model_name} · Mean R² = {model_results[best_model_name]['mean_r2']:.3f}
@@ -625,9 +673,64 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 with tab1:
+    # ── Animation controls ────────────────────────────────────────────
+    if "anim_playing" not in st.session_state:
+        st.session_state.anim_playing = False
+    if "anim_frame" not in st.session_state:
+        st.session_state.anim_frame = 0
+
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 5])
+    with ctrl1:
+        if st.button("▶ Play" if not st.session_state.anim_playing else "⏸ Pause", use_container_width=True):
+            st.session_state.anim_playing = not st.session_state.anim_playing
+            if st.session_state.anim_playing and st.session_state.anim_frame >= len(positions) - 1:
+                st.session_state.anim_frame = 0
+    with ctrl2:
+        if st.button("⏹ Reset", use_container_width=True):
+            st.session_state.anim_playing = False
+            st.session_state.anim_frame = 0
+            st.rerun()
+    with ctrl3:
+        speed = st.selectbox("Speed", ["1x", "2x", "4x", "8x"], index=1, label_visibility="collapsed")
+        step = {"1x": 2, "2x": 4, "4x": 8, "8x": 16}[speed]
+
+    # Frame slider
+    frame_idx = st.slider("Mission Time", 0, len(positions)-1,
+                          st.session_state.anim_frame, label_visibility="collapsed")
+    if frame_idx != st.session_state.anim_frame and not st.session_state.anim_playing:
+        st.session_state.anim_frame = frame_idx
+
+    # Auto-advance if playing
+    if st.session_state.anim_playing:
+        next_frame = st.session_state.anim_frame + step
+        if next_frame >= len(positions):
+            next_frame = 0
+            st.session_state.anim_playing = False
+        st.session_state.anim_frame = next_frame
+        time.sleep(0.05)
+        st.rerun()
+
+    # Plot up to current frame
+    f = st.session_state.anim_frame
+    frac = max(1, f)
+    current_ef   = ef[f]
+    current_mode_anim = "UMBRA" if current_ef >= 1 else "PENUMBRA" if current_ef > 0 else "SUNLIT"
+    mode_col_anim = "#f85149" if current_mode_anim=="UMBRA" else "#e3b341" if current_mode_anim=="PENUMBRA" else "#3fb950"
+
+    # Current time label
+    t_now = times[f] / 60
+    T_min = T / 60
+    orbit_num = int(t_now / T_min) + 1
+    st.markdown(
+        f"<div style='font-family:monospace;font-size:11px;color:#445;margin-bottom:6px;'>"
+        f"T = <span style='color:#00d4ff;'>{t_now:.1f} min</span> &nbsp;|&nbsp; "
+        f"Orbit <span style='color:#00d4ff;'>{orbit_num}/{n_orbits}</span> &nbsp;|&nbsp; "
+        f"Mode: <span style='color:{mode_col_anim};font-weight:bold;'>{current_mode_anim}</span>"
+        f"</div>", unsafe_allow_html=True)
+
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.plotly_chart(plot_orbit_2d(positions, ef, sun_pos, m, color),
+        st.plotly_chart(plot_orbit_2d(positions[:frac], ef[:frac], sun_pos, m, color),
                         use_container_width=True, config={"displayModeBar": False})
     with col2:
         st.markdown(f"<div style='font-family:monospace;font-size:9px;color:#445;letter-spacing:2px;margin-bottom:10px;'>ECLIPSE STATISTICS</div>", unsafe_allow_html=True)
@@ -677,8 +780,24 @@ with tab2:
         st.markdown('<div class="info-box">No eclipse events detected in this simulation window. Try increasing the number of orbits or adjusting the RAAN angle.</div>', unsafe_allow_html=True)
 
 with tab3:
-    st.plotly_chart(plot_telemetry(times, ef, m["battery_start"]),
+    # Show telemetry up to current animation frame
+    f3 = st.session_state.get("anim_frame", len(times)-1)
+    f3 = max(1, f3)
+    st.plotly_chart(plot_telemetry(times[:f3], ef[:f3], m["battery_start"]),
                     use_container_width=True, config={"displayModeBar": False})
+    # Live battery gauge
+    b3 = battery_series[f3-1]
+    b3_color = "#f85149" if b3 < 25 else "#e3b341" if b3 < 50 else "#3fb950"
+    st.markdown(f"""
+    <div style='display:flex;gap:16px;align-items:center;margin-bottom:8px;'>
+      <div style='font-family:monospace;font-size:11px;color:#445;'>LIVE BATTERY:</div>
+      <div style='flex:1;height:18px;background:#1c2333;border-radius:9px;overflow:hidden;'>
+        <div style='width:{b3:.1f}%;height:100%;background:{b3_color};border-radius:9px;
+          transition:width 0.3s;'></div>
+      </div>
+      <div style='font-family:monospace;font-size:14px;font-weight:bold;color:{b3_color};min-width:52px;'>{b3:.1f}%</div>
+    </div>
+    """, unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -746,3 +865,4 @@ with tab5:
                 "Eclipse %": round(np.sum(e2>0)/len(e2)*100, 1),
             })
         st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
+
