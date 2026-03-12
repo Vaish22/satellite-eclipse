@@ -27,6 +27,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 import time
+from datetime import datetime, timezone
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -287,7 +288,7 @@ def train_model():
     return results, best
 
 # ─── Plotting Functions ───────────────────────────────────────────────────────
-def plot_orbit_2d(positions, ef, sun_pos, m, color):
+def plot_orbit_2d(positions, ef, sun_pos, m, color, highlight_frame=None):
     body  = m["body"]
     Rb    = R_BODY[body]
     mu    = MU[body]
@@ -350,16 +351,37 @@ def plot_orbit_2d(positions, ef, sun_pos, m, color):
         textfont=dict(color="#ffd700", size=10, family="Courier New"),
         name="Sun", hoverinfo="skip"))
 
-    # Satellite (last position)
-    sat = positions[-1] / scale
-    ef_last = ef[-1]
-    sat_color = "#f85149" if ef_last >= 1 else "#e3b341" if ef_last > 0 else color
+    # Satellite marker — use highlight_frame for real-time position
+    if highlight_frame is not None and highlight_frame < len(ef):
+        sat_pos_full = positions  # full orbit already passed in live mode
+        # Draw full orbit trail faintly
+        all_x = [p[0]/scale for p in sat_pos_full]
+        all_y = [p[1]/scale for p in sat_pos_full]
+        fig.add_trace(go.Scatter(x=all_x, y=all_y, mode="lines",
+            line=dict(color=color, width=0.5), opacity=0.2,
+            name="Full Orbit", hoverinfo="skip"))
+        sat_idx = highlight_frame
+        ef_sat  = ef[sat_idx] if sat_idx < len(ef) else 0
+    else:
+        sat_idx = len(positions) - 1
+        ef_sat  = ef[-1]
+
+    sat = positions[sat_idx] / scale
+    sat_color = "#f85149" if ef_sat >= 1 else "#e3b341" if ef_sat > 0 else color
+    sat_mode  = "UMBRA" if ef_sat >= 1 else "PENUMBRA" if ef_sat > 0 else "SUNLIT"
+
+    # Pulse ring around satellite
+    fig.add_trace(go.Scatter(
+        x=[sat[0]], y=[sat[1]], mode="markers",
+        marker=dict(size=22, color="rgba(0,0,0,0)",
+                    line=dict(color=sat_color, width=1.5)),
+        name="", hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(
         x=[sat[0]], y=[sat[1]], mode="markers",
         marker=dict(size=12, color=sat_color, symbol="diamond",
                     line=dict(color="white", width=1.5)),
         name="Satellite",
-        hovertemplate=f"<b>Satellite</b><br>Mode: {'UMBRA' if ef_last>=1 else 'PENUMBRA' if ef_last>0 else 'SUNLIT'}<extra></extra>"))
+        hovertemplate=f"<b>Satellite</b><br>Mode: {sat_mode}<extra></extra>"))
 
     fig.update_layout(
         paper_bgcolor="#080c12", plot_bgcolor="#080c12",
@@ -673,65 +695,143 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 with tab1:
-    # ── Animation controls ────────────────────────────────────────────
+    # ── Real-time tracking + manual animation ─────────────────────────
     if "anim_playing" not in st.session_state:
         st.session_state.anim_playing = False
     if "anim_frame" not in st.session_state:
         st.session_state.anim_frame = 0
+    if "tracking_mode" not in st.session_state:
+        st.session_state.tracking_mode = "realtime"
 
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1, 1, 1, 5])
+    # ── Mode toggle ───────────────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.2, 1, 1, 1, 3])
     with ctrl1:
-        if st.button("▶ Play" if not st.session_state.anim_playing else "⏸ Pause", use_container_width=True):
-            st.session_state.anim_playing = not st.session_state.anim_playing
-            if st.session_state.anim_playing and st.session_state.anim_frame >= len(positions) - 1:
-                st.session_state.anim_frame = 0
-    with ctrl2:
-        if st.button("⏹ Reset", use_container_width=True):
+        mode_btn = st.button(
+            "🌍 LIVE" if st.session_state.tracking_mode == "realtime" else "🎬 SIMULATE",
+            use_container_width=True,
+            help="Toggle between real-time position and manual animation"
+        )
+        if mode_btn:
+            st.session_state.tracking_mode = "simulate" if st.session_state.tracking_mode == "realtime" else "realtime"
             st.session_state.anim_playing = False
-            st.session_state.anim_frame = 0
             st.rerun()
-    with ctrl3:
-        speed = st.selectbox("Speed", ["1x", "2x", "4x", "8x"], index=1, label_visibility="collapsed")
-        step = {"1x": 2, "2x": 4, "4x": 8, "8x": 16}[speed]
 
-    # Frame slider
-    frame_idx = st.slider("Mission Time", 0, len(positions)-1,
-                          st.session_state.anim_frame, label_visibility="collapsed")
-    if frame_idx != st.session_state.anim_frame and not st.session_state.anim_playing:
-        st.session_state.anim_frame = frame_idx
+    if st.session_state.tracking_mode == "simulate":
+        with ctrl2:
+            if st.button("▶ Play" if not st.session_state.anim_playing else "⏸ Pause", use_container_width=True):
+                st.session_state.anim_playing = not st.session_state.anim_playing
+                if st.session_state.anim_playing and st.session_state.anim_frame >= len(positions) - 1:
+                    st.session_state.anim_frame = 0
+        with ctrl3:
+            if st.button("⏹ Reset", use_container_width=True):
+                st.session_state.anim_playing = False
+                st.session_state.anim_frame = 0
+                st.rerun()
+        with ctrl4:
+            speed = st.selectbox("Speed", ["1x", "2x", "4x", "8x"], index=1, label_visibility="collapsed")
+            step = {"1x": 2, "2x": 4, "4x": 8, "8x": 16}[speed]
 
-    # Auto-advance if playing
-    if st.session_state.anim_playing:
-        next_frame = st.session_state.anim_frame + step
-        if next_frame >= len(positions):
-            next_frame = 0
-            st.session_state.anim_playing = False
-        st.session_state.anim_frame = next_frame
-        time.sleep(0.05)
-        st.rerun()
+    # ── Compute current frame ─────────────────────────────────────────
+    if st.session_state.tracking_mode == "realtime":
+        # Use actual UTC time to compute where satellite is RIGHT NOW
+        # J2000 epoch = Jan 1 2000 12:00:00 UTC
+        J2000 = datetime(2000, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        elapsed_seconds = (now_utc - J2000).total_seconds()
 
-    # Plot up to current frame
-    f = st.session_state.anim_frame
+        # How many complete seconds into current orbit?
+        orbit_seconds = elapsed_seconds % T  # T = orbital period in seconds
+        # Find closest frame index
+        frame_seconds = times  # times array in seconds
+        f = int(np.searchsorted(frame_seconds, orbit_seconds))
+        f = min(f, len(positions) - 1)
+        st.session_state.anim_frame = f
+
+        # Auto-refresh every 5 seconds so satellite visibly moves
+        st.markdown("""
+        <meta http-equiv="refresh" content="5">
+        """, unsafe_allow_html=True)
+
+    else:
+        # Simulate mode — start from real current position, animate forward
+        # On first entry into simulate mode, sync frame to real-time position
+        if "simulate_start_synced" not in st.session_state or st.session_state.get("last_mission") != mission_name:
+            J2000 = datetime(2000, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+            now_utc_s = datetime.now(timezone.utc)
+            elapsed_s = (now_utc_s - J2000).total_seconds()
+            orbit_s   = elapsed_s % T
+            sync_f    = int(np.searchsorted(times, orbit_s))
+            sync_f    = min(sync_f, len(positions) - 1)
+            st.session_state.anim_frame = sync_f
+            st.session_state.simulate_start_synced = True
+
+        frame_idx = st.slider("Mission Time", 0, len(positions)-1,
+                              st.session_state.anim_frame, label_visibility="collapsed")
+        if frame_idx != st.session_state.anim_frame and not st.session_state.anim_playing:
+            st.session_state.anim_frame = frame_idx
+
+        if st.session_state.anim_playing:
+            next_frame = st.session_state.anim_frame + step
+            if next_frame >= len(positions):
+                # Loop back to beginning of orbit (wrap around)
+                next_frame = next_frame % len(positions)
+            st.session_state.anim_frame = next_frame
+            time.sleep(0.05)
+            st.rerun()
+
+    # ── Current frame info ────────────────────────────────────────────
+    f    = st.session_state.anim_frame
     frac = max(1, f)
-    current_ef   = ef[f]
+    current_ef        = ef[f]
     current_mode_anim = "UMBRA" if current_ef >= 1 else "PENUMBRA" if current_ef > 0 else "SUNLIT"
-    mode_col_anim = "#f85149" if current_mode_anim=="UMBRA" else "#e3b341" if current_mode_anim=="PENUMBRA" else "#3fb950"
+    mode_col_anim     = "#f85149" if current_mode_anim=="UMBRA" else "#e3b341" if current_mode_anim=="PENUMBRA" else "#3fb950"
 
-    # Current time label
-    t_now = times[f] / 60
-    T_min = T / 60
-    orbit_num = int(t_now / T_min) + 1
+    t_now_min = times[f] / 60
+    T_min     = T / 60
+    orbit_num = int(t_now_min / T_min) + 1
+
+    # Real UTC clock
+    now_utc   = datetime.now(timezone.utc)
+    utc_str   = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Find time until next eclipse from current frame
+    next_eclipse_str = "—"
+    if current_ef == 0:
+        for k in range(f, len(ef)):
+            if ef[k] > 0:
+                mins_until = (times[k] - times[f]) / 60
+                next_eclipse_str = f"{mins_until:.1f} min"
+                break
+    else:
+        # Already in eclipse — find time until exit
+        for k in range(f, len(ef)):
+            if ef[k] == 0:
+                mins_exit = (times[k] - times[f]) / 60
+                next_eclipse_str = f"exits in {mins_exit:.1f} min"
+                break
+
+    mode_label = "🌍 LIVE POSITION" if st.session_state.tracking_mode == "realtime" else "🎬 SIMULATION"
     st.markdown(
-        f"<div style='font-family:monospace;font-size:11px;color:#445;margin-bottom:6px;'>"
-        f"T = <span style='color:#00d4ff;'>{t_now:.1f} min</span> &nbsp;|&nbsp; "
-        f"Orbit <span style='color:#00d4ff;'>{orbit_num}/{n_orbits}</span> &nbsp;|&nbsp; "
-        f"Mode: <span style='color:{mode_col_anim};font-weight:bold;'>{current_mode_anim}</span>"
+        f"<div style='font-family:monospace;font-size:11px;color:#445;margin-bottom:6px;display:flex;gap:20px;'>"
+        f"<span style='color:#00d4ff;font-weight:bold;'>{mode_label}</span>"
+        f"<span>🕐 {utc_str}</span>"
+        f"<span>Orbit pos: <b style='color:#00d4ff;'>{t_now_min:.1f} min / {T_min:.1f} min</b></span>"
+        f"<span>Mode: <b style='color:{mode_col_anim};'>{current_mode_anim}</b></span>"
+        f"<span>Next eclipse: <b style='color:#e3b341;'>{next_eclipse_str}</b></span>"
         f"</div>", unsafe_allow_html=True)
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.plotly_chart(plot_orbit_2d(positions[:frac], ef[:frac], sun_pos, m, color),
-                        use_container_width=True, config={"displayModeBar": False})
+        # In live mode: show full orbit as faint trail + bright dot at real position
+        # In simulate mode: draw orbit up to current frame
+        if st.session_state.tracking_mode == "realtime":
+            st.plotly_chart(
+                plot_orbit_2d(positions, ef, sun_pos, m, color, highlight_frame=f),
+                use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.plotly_chart(
+                plot_orbit_2d(positions[:frac], ef[:frac], sun_pos, m, color, highlight_frame=None),
+                use_container_width=True, config={"displayModeBar": False})
     with col2:
         st.markdown(f"<div style='font-family:monospace;font-size:9px;color:#445;letter-spacing:2px;margin-bottom:10px;'>ECLIPSE STATISTICS</div>", unsafe_allow_html=True)
         stats = [
@@ -865,4 +965,3 @@ with tab5:
                 "Eclipse %": round(np.sum(e2>0)/len(e2)*100, 1),
             })
         st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
-
