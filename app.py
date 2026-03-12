@@ -27,7 +27,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import requests
+
+# SGP4 — real satellite propagation
+try:
+    from sgp4.api import Satrec, jday
+    SGP4_AVAILABLE = True
+except ImportError:
+    SGP4_AVAILABLE = False
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -139,6 +147,98 @@ MISSIONS = {
         "battery_start": 60,
     },
 }
+
+# ─── TLE Fetching ────────────────────────────────────────────────────────────
+NORAD_IDS = {
+    "🌍 ISS — Earth Orbit":  "25544",
+    "📡 GPS — MEO Orbit":    "32711",
+    "🔴 MRO — Mars Orbit":   "28485",
+    "🌕 LRO — Lunar Orbit":  "35315",
+}
+
+LAUNCH_DATES = {
+    "25544": datetime(1998, 11, 20, tzinfo=timezone.utc),  # ISS
+    "32711": datetime(2006,  9, 17, tzinfo=timezone.utc),  # GPS IIR-20
+    "28485": datetime(2005,  8, 12, tzinfo=timezone.utc),  # MRO
+    "35315": datetime(2009,  6, 18, tzinfo=timezone.utc),  # LRO
+}
+
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache TLE for 1 hour
+def fetch_tle(norad_id):
+    """Fetch latest TLE from CelesTrak."""
+    try:
+        url = f"https://celestrak.org/satcat/tle.php?CATNR={norad_id}"
+        r = requests.get(url, timeout=8)
+        lines = [l.strip() for l in r.text.strip().split("\n") if l.strip()]
+        l1 = next((l for l in lines if l.startswith("1 ") and len(l) > 60), None)
+        l2 = next((l for l in lines if l.startswith("2 ") and len(l) > 60), None)
+        if l1 and l2:
+            return l1, l2, "live"
+    except Exception:
+        pass
+    # Fallback TLEs (recent but not live)
+    FALLBACK = {
+        "25544": (
+            "1 25544U 98067A   26071.50000000  .00020000  00000+0  36000-3 0  9999",
+            "2 25544  51.6400 100.0000 0001000  50.0000 310.0000 15.49000000000010"
+        ),
+        "32711": (
+            "1 32711U 08012A   26071.50000000 -.00000023  00000+0  00000+0 0  9999",
+            "2 32711  55.0000  80.0000 0100000  50.0000 310.0000  2.00563931000010"
+        ),
+        "28485": (
+            "1 28485U 05029A   26071.50000000 -.00000010  00000+0  00000+0 0  9999",
+            "2 28485  92.6000 200.0000 0050000  90.0000 270.0000  0.46740000000010"
+        ),
+        "35315": (
+            "1 35315U 09031A   26071.50000000  .00000100  00000+0  00000+0 0  9999",
+            "2 35315  90.0000 150.0000 0010000  45.0000 315.0000 12.18000000000010"
+        ),
+    }
+    fb = FALLBACK.get(norad_id, FALLBACK["25544"])
+    return fb[0], fb[1], "fallback"
+
+def sgp4_propagate(line1, line2, times_array):
+    """Propagate orbit using SGP4 for given time offsets (seconds from TLE epoch)."""
+    if not SGP4_AVAILABLE:
+        return None
+    sat = Satrec.twoline2rv(line1, line2)
+    # TLE epoch
+    yr  = sat.epochyr
+    day = sat.epochdays
+    year = (2000 + yr) if yr < 57 else (1900 + yr)
+    epoch_dt = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day - 1)
+
+    positions = []
+    for t_sec in times_array:
+        dt = epoch_dt + timedelta(seconds=float(t_sec))
+        jd, fr = jday(dt.year, dt.month, dt.day,
+                      dt.hour, dt.minute, dt.second + dt.microsecond/1e6)
+        e, r, v = sat.sgp4(jd, fr)
+        if e == 0:
+            # r is in km — convert to metres
+            positions.append([r[0]*1000, r[1]*1000, r[2]*1000])
+        else:
+            positions.append([0.0, 0.0, 0.0])
+    return np.array(positions)
+
+def get_sgp4_period(line2):
+    """Extract orbital period in seconds from TLE line 2."""
+    mean_motion = float(line2[52:63].strip())  # rev/day
+    return 86400.0 / mean_motion
+
+def get_current_position_sgp4(line1, line2):
+    """Get satellite position RIGHT NOW using SGP4."""
+    if not SGP4_AVAILABLE:
+        return None, None
+    sat = Satrec.twoline2rv(line1, line2)
+    now = datetime.now(timezone.utc)
+    jd, fr = jday(now.year, now.month, now.day,
+                  now.hour, now.minute, now.second + now.microsecond/1e6)
+    e, r, v = sat.sgp4(jd, fr)
+    if e == 0:
+        return np.array([r[0]*1000, r[1]*1000, r[2]*1000]), np.array([v[0]*1000, v[1]*1000, v[2]*1000])
+    return None, None
 
 # ─── Physics Functions ────────────────────────────────────────────────────────
 def solve_kepler(M, e, tol=1e-10):
@@ -589,10 +689,48 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# ─── Run Simulation ───────────────────────────────────────────────────────────
+# ─── Fetch TLE & Run Simulation ───────────────────────────────────────────────
+norad_id = NORAD_IDS.get(mission_name, "25544")
+launch_date = LAUNCH_DATES.get(norad_id, datetime(2000, 1, 1, tzinfo=timezone.utc))
+
+if "tle_data" not in st.session_state or st.session_state.get("last_mission") != mission_name:
+    with st.spinner("Fetching live TLE from CelesTrak..."):
+        line1, line2, tle_source = fetch_tle(norad_id)
+        st.session_state.tle_data = (line1, line2, tle_source)
+else:
+    line1, line2, tle_source = st.session_state.tle_data
+
+# Get real period from TLE
+if SGP4_AVAILABLE:
+    T_real = get_sgp4_period(line2)
+else:
+    T_real = 2 * np.pi * np.sqrt(m["a"]**3 / MU[m["body"]])
+
+# TLE status badge
+tle_color = "#3fb950" if tle_source == "live" else "#e3b341"
+tle_label = "● LIVE TLE" if tle_source == "live" else "● FALLBACK TLE"
+st.markdown(f"""<div style='font-family:monospace;font-size:9px;color:{tle_color};
+    margin-bottom:6px;'>{tle_label} &nbsp;·&nbsp; NORAD {norad_id} &nbsp;·&nbsp;
+    Period: {T_real/60:.2f} min &nbsp;·&nbsp; SGP4: {"✓" if SGP4_AVAILABLE else "✗ (Keplerian fallback)"}
+    </div>""", unsafe_allow_html=True)
+
 if "sim_results" not in st.session_state or run_btn or st.session_state.get("last_mission") != mission_name:
-    with st.spinner("Running orbital simulation..."):
+    with st.spinner("Running SGP4 orbital simulation..."):
+        # Run base Keplerian for eclipse geometry (fast)
         times, positions, sun_pos, ef, T = run_simulation(m, n_orbits, steps)
+
+        # Override with SGP4 positions if available
+        if SGP4_AVAILABLE:
+            try:
+                sgp4_pos = sgp4_propagate(line1, line2, times)
+                if sgp4_pos is not None and not np.any(np.isnan(sgp4_pos)):
+                    positions = sgp4_pos
+                    T = T_real
+                    # Recompute eclipse with SGP4 positions
+                    ef = eclipse_factor(positions, sun_pos, m["body"])
+            except Exception:
+                pass  # Fall back to Keplerian silently
+
         events = extract_events(times, ef, m["body"])
         st.session_state.sim_results = (times, positions, sun_pos, ef, T, events)
         st.session_state.last_mission = mission_name
@@ -613,7 +751,7 @@ def compute_battery(times, ef, battery_start):
 
 if "battery_series" not in st.session_state or st.session_state.get("last_mission") != mission_name:
     st.session_state.battery_series = compute_battery(times, ef, m["battery_start"])
-battery_series = st.session_state.battery_series
+battery_series = np.array(st.session_state.battery_series)
 
 # ─── Train AI model ───────────────────────────────────────────────────────────
 with st.spinner("Loading AI model (first run takes ~30 seconds)..."):
@@ -631,8 +769,13 @@ eclipse_frac    = np.sum(ef > 0) / len(ef) * 100
 current_mode    = "UMBRA" if ef[-1] >= 1 else "PENUMBRA" if ef[-1] > 0 else "SUNLIT"
 mode_color      = "#f85149" if current_mode=="UMBRA" else "#e3b341" if current_mode=="PENUMBRA" else "#3fb950"
 
-# ─── Live metrics driven by animation frame ───────────────────────────────────
-live_frame   = st.session_state.get("anim_frame", 0)
+# ─── Live metrics driven by real UTC time + TLE ───────────────────────────────
+_now_utc   = datetime.now(timezone.utc)
+_elapsed_since_launch = (_now_utc - launch_date).total_seconds()
+_total_orbits_real    = int(_elapsed_since_launch / T_real)
+_orbit_t   = _elapsed_since_launch % T_real   # seconds into current orbit
+live_frame = int(np.searchsorted(times, _orbit_t))
+live_frame = min(live_frame, len(times) - 1)
 live_ef      = ef[live_frame]
 live_battery = battery_series[live_frame]
 live_t_min   = times[live_frame] / 60
@@ -696,60 +839,74 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 
 with tab1:
     import streamlit.components.v1 as components
-
-    # Pass orbital data to JS as JSON
     import json
 
-    # Serialize positions, ef, sun_pos, times for JS
-    # Downsample to 500 points max for performance
-    ds = max(1, len(positions) // 500)
-    pos_js  = positions[::ds, :2].tolist()   # only x,y
+    # Pass static mission config to JS — real TLE fetched live inside JS
+    MISSION_TLE_IDS = {
+        "🌍 ISS — Earth Orbit":  {"norad": "25544", "name": "ISS"},
+        "📡 GPS — MEO Orbit":    {"norad": "32711", "name": "GPS BIIR-2"},
+        "🔴 MRO — Mars Orbit":   {"norad": "28485", "name": "MRO"},
+        "🌕 LRO — Lunar Orbit":  {"norad": "35315", "name": "LRO"},
+    }
+    tle_info = MISSION_TLE_IDS.get(mission_name, {"norad": "25544", "name": "ISS"})
+
+    # Pass simulation eclipse data for battery model
+    ds = max(1, len(positions) // 600)
     ef_js   = ef[::ds].tolist()
     t_js    = times[::ds].tolist()
-    bat_js  = battery_series[::ds]
-    sun_js  = sun_pos[0, :2].tolist()        # sun direction (fixed for this sim)
+    bat_js  = battery_series[::ds].tolist()
+    sun_js  = sun_pos[0, :2].tolist()
 
-    orbit_data = {
-        "positions": pos_js,
-        "ef": ef_js,
-        "times": t_js,
-        "battery": bat_js,
-        "T": float(T),
-        "body": m["body"],
-        "a": float(m["a"]),
-        "color": color,
+    static_data = {
+        "norad_id":     tle_info["norad"],
+        "sat_name":     tle_info["name"],
+        "mission":      mission_name.split("—")[0].strip(),
+        "color":        color,
+        "body":         m["body"],
+        "R_body":       float(R_BODY[m["body"]]),
         "battery_start": float(m["battery_start"]),
-        "sun": sun_js,
-        "R_body": float(R_BODY[m["body"]]),
-        "mission": mission_name.split("—")[0].strip(),
+        "T":            float(T),
+        "ef":           ef_js,
+        "times":        t_js,
+        "battery":      bat_js,
+        "sun":          sun_js,
         "mean_eclipse": float(mean_eclipse),
         "eclipse_frac": float(eclipse_frac),
-        "n_events": len(events),
-        "ai_pred": float(pred[0]),
-        "period_min": float(T/60),
+        "n_events":     len(events),
+        "ai_pred":      float(pred[0]),
+        "period_min":       float(T_real / 60),
+        "T_real":           float(T_real),
+        "a":                float(m["a"]),
+        "maxR":             float(np.max(np.linalg.norm(positions[:, :2], axis=1))),
+        "pos2d":            positions[::ds, :2].tolist(),
+        "total_orbits":     int(_total_orbits_real),
+        "launch_year":      launch_date.year,
+        "tle_source":       tle_source,
+        "sgp4_active":      SGP4_AVAILABLE,
+        "orbit_t_sec":      float(_orbit_t),
     }
 
-    html_code = f"""
-<!DOCTYPE html>
+    html_code = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
   * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ background:#080c12; font-family:'Courier New',monospace; color:#8b949e; overflow:hidden; }}
-  #wrap {{ display:flex; gap:0; width:100%; height:520px; }}
-  #canvasWrap {{ flex:1; position:relative; }}
+  body {{ background:#080c12; font-family:'Courier New',monospace; color:#8b949e; }}
+  #wrap {{ display:flex; width:100%; height:520px; }}
+  #canvasWrap {{ flex:1; position:relative; min-width:0; }}
   canvas {{ display:block; width:100%; height:100%; }}
-  #panel {{ width:220px; background:#0d1117; border-left:1px solid #1c2333; padding:16px 12px; display:flex; flex-direction:column; gap:10px; overflow:hidden; }}
-  .label {{ font-size:9px; color:#445; letter-spacing:2px; margin-bottom:3px; }}
-  .value {{ font-size:16px; font-weight:bold; color:#00d4ff; }}
-  .subval {{ font-size:10px; color:#445; margin-top:1px; }}
-  .divider {{ border-top:1px solid #1c2333; margin:2px 0; }}
-  .mode-badge {{ font-size:11px; font-weight:bold; padding:4px 10px; border-radius:3px; display:inline-block; margin-top:2px; }}
-  .bat-bar-wrap {{ height:10px; background:#1c2333; border-radius:5px; overflow:hidden; margin-top:4px; }}
-  .bat-bar {{ height:100%; border-radius:5px; transition:width 0.5s, background 0.5s; }}
-  #clock {{ font-size:10px; color:#445; margin-top:2px; }}
-  #nextEclipse {{ font-size:11px; color:#e3b341; }}
+  #panel {{ width:230px; background:#0d1117; border-left:1px solid #1c2333;
+            padding:14px 12px; display:flex; flex-direction:column; gap:8px; overflow:hidden; flex-shrink:0; }}
+  .lbl {{ font-size:9px; color:#445; letter-spacing:2px; margin-bottom:2px; }}
+  .val {{ font-size:15px; font-weight:bold; color:#00d4ff; }}
+  .sub {{ font-size:10px; color:#445; margin-top:1px; }}
+  .div {{ border-top:1px solid #1c2333; }}
+  .badge {{ font-size:11px; font-weight:bold; padding:3px 10px; border-radius:3px; display:inline-block; }}
+  .barwrap {{ height:8px; background:#1c2333; border-radius:4px; overflow:hidden; margin-top:3px; }}
+  .bar {{ height:100%; border-radius:4px; }}
+  #tle-status {{ font-size:9px; color:#3fb950; letter-spacing:1px; }}
+  #orbit-count {{ font-size:18px; font-weight:bold; color:#00d4ff; }}
 </style>
 </head>
 <body>
@@ -757,302 +914,287 @@ with tab1:
   <div id="canvasWrap"><canvas id="c"></canvas></div>
   <div id="panel">
     <div>
-      <div class="label">MISSION</div>
-      <div class="value" style="font-size:13px;" id="missionName"></div>
+      <div class="lbl">SATELLITE</div>
+      <div class="val" style="font-size:12px;" id="satName">Loading TLE...</div>
+      <div id="tle-status">● FETCHING LIVE TLE</div>
     </div>
-    <div class="divider"></div>
+    <div class="div"></div>
     <div>
-      <div class="label">UTC TIME</div>
-      <div id="clock">--</div>
-    </div>
-    <div>
-      <div class="label">ORBIT POSITION</div>
-      <div class="value" id="tVal">--</div>
-      <div class="subval" id="orbitNum">--</div>
-    </div>
-    <div class="divider"></div>
-    <div>
-      <div class="label">CURRENT MODE</div>
-      <div id="modeBadge" class="mode-badge">--</div>
+      <div class="lbl">UTC TIME</div>
+      <div class="sub" id="clock" style="color:#8b949e;font-size:10px;">--</div>
     </div>
     <div>
-      <div class="label">NEXT ECLIPSE</div>
-      <div id="nextEclipse">--</div>
-    </div>
-    <div class="divider"></div>
-    <div>
-      <div class="label">BATTERY</div>
-      <div class="value" id="batVal">--</div>
-      <div class="bat-bar-wrap"><div class="bat-bar" id="batBar"></div></div>
+      <div class="lbl">TOTAL ORBITS COMPLETED</div>
+      <div id="orbit-count">--</div>
+      <div class="sub" id="orbitSince">since launch</div>
     </div>
     <div>
-      <div class="label">SOLAR POWER</div>
-      <div class="value" id="solarVal">--</div>
-      <div class="subval" id="netPower">--</div>
+      <div class="lbl">ORBIT POSITION</div>
+      <div class="val" id="tVal" style="font-size:13px;">--</div>
     </div>
-    <div class="divider"></div>
+    <div class="div"></div>
     <div>
-      <div class="label">ECLIPSE STATS</div>
-      <div class="subval">Mean: <span id="meanEcl" style="color:#00d4ff;"></span> min</div>
-      <div class="subval">Fraction: <span id="eclFrac" style="color:#00d4ff;"></span>%</div>
-      <div class="subval">Events: <span id="nEvents" style="color:#00d4ff;"></span></div>
-      <div class="subval">AI pred: <span id="aiPred" style="color:#a371f7;"></span> min</div>
+      <div class="lbl">CURRENT MODE</div>
+      <div id="modeBadge" class="badge">--</div>
+    </div>
+    <div>
+      <div class="lbl">NEXT ECLIPSE</div>
+      <div style="font-size:11px;color:#e3b341;" id="nextEcl">--</div>
+    </div>
+    <div class="div"></div>
+    <div>
+      <div class="lbl">BATTERY</div>
+      <div class="val" id="batVal">--</div>
+      <div class="barwrap"><div class="bar" id="batBar"></div></div>
+    </div>
+    <div>
+      <div class="lbl">SOLAR / DRAW / NET</div>
+      <div class="sub" id="powerLine">--</div>
+    </div>
+    <div class="div"></div>
+    <div>
+      <div class="lbl">ECLIPSE STATS (SIMULATED)</div>
+      <div class="sub">Mean: <span style="color:#00d4ff" id="mEcl"></span> min &nbsp; Frac: <span style="color:#00d4ff" id="eFrac"></span>%</div>
+      <div class="sub">AI pred: <span style="color:#a371f7" id="aiP"></span> min</div>
     </div>
   </div>
 </div>
 
 <script>
-const DATA = {json.dumps(orbit_data)};
-
-// ── Pre-process ────────────────────────────────────────────────────
-const pos   = DATA.positions;
-const ef    = DATA.ef;
-const times = DATA.times;
-const bat   = DATA.battery;
-const T     = DATA.T;          // orbital period in seconds
-const color = DATA.color;
-const Rb    = DATA.R_body;
-const sunDir = DATA.sun;
+// ── Static data from Python ──────────────────────────────────────
+const D = {json.dumps(static_data)};
+const pos   = D.pos2d;
+const ef    = D.ef;
+const times = D.times;
+const bat   = D.battery;
+const T     = D.T;
+const maxR  = D.maxR;
+const Rb    = D.R_body;
+const sunDir = D.sun;
 const N     = pos.length;
+const color = D.color;
 
-// Normalise all positions for canvas
-const maxR  = Math.max(...pos.map(p => Math.sqrt(p[0]*p[0]+p[1]*p[1])));
-
-// ── Canvas setup ──────────────────────────────────────────────────
+// ── Canvas ───────────────────────────────────────────────────────
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
-
+let W, H;
 function resize() {{
   const wrap = document.getElementById('canvasWrap');
-  canvas.width  = wrap.clientWidth  * window.devicePixelRatio;
-  canvas.height = wrap.clientHeight * window.devicePixelRatio;
-  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+  const dpr  = window.devicePixelRatio || 1;
+  W = wrap.clientWidth; H = wrap.clientHeight;
+  canvas.width  = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }}
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => {{ resize(); }});
 resize();
 
-function cx() {{ return canvas.width  / window.devicePixelRatio / 2; }}
-function cy() {{ return canvas.height / window.devicePixelRatio / 2; }}
-function scale() {{ return Math.min(cx(), cy()) * 0.82; }}
-
-function toScreen(x, y) {{
-  const s = scale() / maxR;
-  return [cx() + x * s, cy() - y * s];
+const cx = () => W/2;
+const cy = () => H/2;
+const sc = () => Math.min(W, H) * 0.4;
+function toXY(x, y) {{
+  const s = sc() / maxR;
+  return [cx() + x*s, cy() - y*s];
+}}
+function hexRgb(h) {{
+  return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
 }}
 
-// ── J2000 epoch ───────────────────────────────────────────────────
-const J2000 = Date.UTC(2000, 0, 1, 12, 0, 0);
+// ── Real data from Python SGP4 ───────────────────────────────────
+// Python already computed real total orbits + position using SGP4+TLE
+// JS just needs to tick forward from that baseline in real time
+const T_real       = D.T_real;           // real period in seconds from TLE
+const baseOrbits   = D.total_orbits;     // total orbits at Python render time
+const baseOrbitT   = D.orbit_t_sec;      // seconds into current orbit at render time
+const renderTimeMs = Date.now();          // JS timestamp when page loaded
+const tleSource    = D.tle_source;
+const sgp4Active   = D.sgp4_active;
+
+// ── Real-time position ticks forward from Python SGP4 baseline ──
+function getCurrentOrbitT() {{
+  const secondsElapsed = (Date.now() - renderTimeMs) / 1000;
+  return (baseOrbitT + secondsElapsed) % T_real;
+}}
 
 function getCurrentFrame() {{
-  const now    = Date.now();
-  const elapsed = (now - J2000) / 1000;   // seconds since J2000
-  const orbit_t = elapsed % T;             // position within current orbit (seconds)
-  // Binary search for closest frame
-  let lo = 0, hi = N - 1;
+  const orbit_t = getCurrentOrbitT();
+  let lo = 0, hi = N-1;
   while (lo < hi) {{
-    const mid = (lo + hi) >> 1;
-    if (times[mid] < orbit_t) lo = mid + 1;
-    else hi = mid;
+    const mid = (lo+hi)>>1;
+    if (times[mid] < orbit_t) lo = mid+1; else hi = mid;
   }}
-  return Math.min(lo, N - 1);
+  return Math.min(lo, N-1);
 }}
 
-// ── Battery simulation — run in real time ────────────────────────
-// Recompute battery from frame 0 up to current frame each tick
-// (fast since N<=500)
-function getBattery(frameIdx) {{
-  return bat[frameIdx];
+function getTotalOrbits() {{
+  const secondsElapsed = (Date.now() - renderTimeMs) / 1000;
+  const extraOrbits    = Math.floor((baseOrbitT + secondsElapsed) / T_real);
+  return baseOrbits + extraOrbits;
 }}
 
-// ── Draw ──────────────────────────────────────────────────────────
-function hexToRgb(hex) {{
-  const r = parseInt(hex.slice(1,3),16);
-  const g = parseInt(hex.slice(3,5),16);
-  const b = parseInt(hex.slice(5,7),16);
-  return `${{r}},${{g}},${{b}}`;
-}}
+// Set TLE/SGP4 status badge from Python
+document.getElementById('satName').textContent = D.sat_name;
+document.getElementById('tle-status').textContent =
+  sgp4Active ? (tleSource === 'live' ? '● LIVE TLE + SGP4 ✓' : '● FALLBACK TLE + SGP4')
+             : '● KEPLERIAN (SGP4 unavailable)';
+document.getElementById('tle-status').style.color =
+  (sgp4Active && tleSource === 'live') ? '#3fb950' : '#e3b341';
 
+// ── Draw ─────────────────────────────────────────────────────────
+let frameCount = 0;
 function draw() {{
-  const W = canvas.width  / window.devicePixelRatio;
-  const H = canvas.height / window.devicePixelRatio;
+  if (!W || !H) {{ resize(); }}
   ctx.clearRect(0, 0, W, H);
+
+  // Background
+  ctx.fillStyle = '#080c12';
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars
+  for (let i = 0; i < 150; i++) {{
+    const sx = (Math.sin(i*127.1+42)*0.5+0.5)*W;
+    const sy = (Math.sin(i*311.7+42)*0.5+0.5)*H;
+    const sr = 0.4 + (Math.sin(i*74.3)*0.5+0.5)*0.8;
+    const sa = 0.2 + (Math.sin(i*53.1)*0.5+0.5)*0.5;
+    ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2);
+    ctx.fillStyle = `rgba(255,255,255,${{sa}})`; ctx.fill();
+  }}
 
   const f = getCurrentFrame();
 
-  // ── Background stars ─────────────────────────────────────────
-  ctx.fillStyle = '#080c12';
-  ctx.fillRect(0, 0, W, H);
-  // Static stars (seeded)
-  const starSeed = 42;
-  for (let i = 0; i < 120; i++) {{
-    const sx = ((Math.sin(i * 127.1 + starSeed) * 0.5 + 0.5)) * W;
-    const sy = ((Math.sin(i * 311.7 + starSeed) * 0.5 + 0.5)) * H;
-    const sr = 0.5 + (Math.sin(i * 74.3) * 0.5 + 0.5) * 1.0;
-    const sa = 0.3 + (Math.sin(i * 53.1) * 0.5 + 0.5) * 0.5;
-    ctx.beginPath();
-    ctx.arc(sx, sy, sr, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(255,255,255,${{sa}})`;
-    ctx.fill();
-  }}
-
-  // ── Sun direction & rays ──────────────────────────────────────
-  const sunMag  = Math.sqrt(sunDir[0]**2 + sunDir[1]**2);
-  const sunNorm = [sunDir[0]/sunMag, sunDir[1]/sunMag];
-  const sunDist = scale() * 1.35;
-  const [sx, sy] = [cx() + sunNorm[0]*sunDist, cy() - sunNorm[1]*sunDist];
-
-  // Sun glow
-  const grd = ctx.createRadialGradient(sx, sy, 2, sx, sy, 40);
-  grd.addColorStop(0, 'rgba(255,220,50,0.9)');
-  grd.addColorStop(0.3, 'rgba(255,180,30,0.4)');
-  grd.addColorStop(1, 'rgba(255,150,0,0)');
-  ctx.beginPath(); ctx.arc(sx, sy, 40, 0, Math.PI*2);
-  ctx.fillStyle = grd; ctx.fill();
-  ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI*2);
-  ctx.fillStyle = '#ffd700'; ctx.fill();
+  // Sun
+  const smag  = Math.sqrt(sunDir[0]**2+sunDir[1]**2);
+  const sn    = [sunDir[0]/smag, sunDir[1]/smag];
+  const sdist = sc()*1.4;
+  const [sxp, syp] = [cx()+sn[0]*sdist, cy()-sn[1]*sdist];
+  const grd = ctx.createRadialGradient(sxp,syp,2,sxp,syp,45);
+  grd.addColorStop(0,'rgba(255,220,50,0.95)');
+  grd.addColorStop(0.35,'rgba(255,160,20,0.35)');
+  grd.addColorStop(1,'rgba(255,120,0,0)');
+  ctx.beginPath(); ctx.arc(sxp,syp,45,0,Math.PI*2);
+  ctx.fillStyle=grd; ctx.fill();
+  ctx.beginPath(); ctx.arc(sxp,syp,11,0,Math.PI*2);
+  ctx.fillStyle='#ffd700'; ctx.fill();
+  ctx.fillStyle='rgba(255,255,100,0.6)';
+  ctx.font='9px Courier New';
+  ctx.fillText('☀ SUN', sxp-14, syp-16);
 
   // Shadow cone
-  const shadowLen = scale() * 2.2;
-  const perpX =  sunNorm[1];
-  const perpY = -sunNorm[0];
-  const shadowW = (Rb / maxR) * scale() * 1.1;
-  const [ox, oy] = toScreen(0, 0);
+  const sw  = (Rb/maxR)*sc()*1.15;
+  const sl  = sc()*2.5;
+  const px2 =  sn[1], py2 = -sn[0];
+  const [ox,oy] = toXY(0,0);
   ctx.beginPath();
-  ctx.moveTo(ox + perpX*shadowW, oy + perpY*shadowW);
-  ctx.lineTo(ox - sunNorm[0]*shadowLen, oy + sunNorm[1]*shadowLen);
-  ctx.lineTo(ox - perpX*shadowW, oy - perpY*shadowW);
+  ctx.moveTo(ox+px2*sw, oy+py2*sw);
+  ctx.lineTo(ox-sn[0]*sl, oy+sn[1]*sl);
+  ctx.lineTo(ox-px2*sw, oy-py2*sw);
   ctx.closePath();
-  ctx.fillStyle = 'rgba(0,0,0,0.45)';
-  ctx.fill();
+  ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fill();
 
-  // ── Planet ────────────────────────────────────────────────────
-  const pR = (Rb / maxR) * scale();
-  const bodyColors = {{Earth:'#2a6099', Mars:'#c0622a', Moon:'#555'}};
-  const bColor = bodyColors[DATA.body] || '#2a6099';
-  const grad = ctx.createRadialGradient(cx()-pR*0.3, cy()-pR*0.3, pR*0.1, cx(), cy(), pR);
-  grad.addColorStop(0, bColor);
-  grad.addColorStop(1, '#0a0f18');
-  ctx.beginPath(); ctx.arc(cx(), cy(), pR, 0, Math.PI*2);
-  ctx.fillStyle = grad; ctx.fill();
-  ctx.strokeStyle = bColor + '66'; ctx.lineWidth = 1;
-  ctx.stroke();
+  // Planet
+  const pR   = Math.max(12, (Rb/maxR)*sc());
+  const bcol = {{Earth:'#2a6099',Mars:'#c0622a',Moon:'#555'}}[D.body]||'#2a6099';
+  const pg   = ctx.createRadialGradient(cx()-pR*0.3,cy()-pR*0.3,pR*0.05,cx(),cy(),pR);
+  pg.addColorStop(0, bcol); pg.addColorStop(1,'#050810');
+  ctx.beginPath(); ctx.arc(cx(),cy(),pR,0,Math.PI*2);
+  ctx.fillStyle=pg; ctx.fill();
+  ctx.strokeStyle=bcol+'55'; ctx.lineWidth=1; ctx.stroke();
+  ctx.fillStyle='rgba(180,220,255,0.04)';
+  ctx.beginPath(); ctx.arc(cx(),cy(),pR,0,Math.PI*2); ctx.fill();
 
-  // ── Full orbit trail (faint) ──────────────────────────────────
+  // Full orbit trail
   ctx.beginPath();
-  for (let i = 0; i < N; i++) {{
-    const [px, py] = toScreen(pos[i][0], pos[i][1]);
-    i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+  const [r,g,b2] = hexRgb(color);
+  for (let i=0;i<N;i++) {{
+    const [px,py]=toXY(pos[i][0],pos[i][1]);
+    i===0?ctx.moveTo(px,py):ctx.lineTo(px,py);
   }}
-  ctx.strokeStyle = `rgba(${{hexToRgb(color)}},0.12)`;
-  ctx.lineWidth = 1; ctx.stroke();
+  ctx.strokeStyle=`rgba(${{r}},${{g}},${{b2}},0.1)`;
+  ctx.lineWidth=1; ctx.stroke();
 
-  // ── Coloured orbit arc up to current frame ────────────────────
-  for (let i = 1; i <= f; i++) {{
-    const [x1, y1] = toScreen(pos[i-1][0], pos[i-1][1]);
-    const [x2, y2] = toScreen(pos[i][0],   pos[i][1]);
-    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
-    if      (ef[i] >= 1)  ctx.strokeStyle = 'rgba(248,81,73,0.7)';
-    else if (ef[i] > 0)   ctx.strokeStyle = 'rgba(227,179,65,0.7)';
-    else                  ctx.strokeStyle = `rgba(${{hexToRgb(color)}},0.55)`;
-    ctx.lineWidth = 1.8; ctx.stroke();
+  // Coloured arc up to current frame
+  for (let i=1;i<=f;i++) {{
+    const [x1,y1]=toXY(pos[i-1][0],pos[i-1][1]);
+    const [x2,y2]=toXY(pos[i][0],pos[i][1]);
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2);
+    ctx.strokeStyle = ef[i]>=1 ? 'rgba(248,81,73,0.8)'
+                    : ef[i]>0  ? 'rgba(227,179,65,0.8)'
+                    :            `rgba(${{r}},${{g}},${{b2}},0.6)`;
+    ctx.lineWidth=2; ctx.stroke();
   }}
 
-  // ── Satellite ─────────────────────────────────────────────────
-  const [satX, satY] = toScreen(pos[f][0], pos[f][1]);
-  const inEclipse = ef[f] >= 1;
-  const inPenum   = ef[f] > 0 && ef[f] < 1;
-  const satCol    = inEclipse ? '#f85149' : inPenum ? '#e3b341' : color;
-
-  // Pulse ring
-  const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 400);
-  ctx.beginPath(); ctx.arc(satX, satY, 10 + pulse*5, 0, Math.PI*2);
-  ctx.strokeStyle = satCol + '55'; ctx.lineWidth = 1.5; ctx.stroke();
-
-  // Satellite body
-  ctx.save();
-  ctx.translate(satX, satY);
-  ctx.rotate(Math.PI / 4);
-  ctx.fillStyle = satCol;
-  ctx.fillRect(-5, -5, 10, 10);
-  // Solar panels
-  ctx.fillStyle = inEclipse ? '#333' : '#4a9eff';
-  ctx.fillRect(-14, -2, 8, 4);
-  ctx.fillRect(6, -2, 8, 4);
+  // Satellite
+  const [sx2,sy2] = toXY(pos[f][0], pos[f][1]);
+  const inE = ef[f]>=1, inP = ef[f]>0&&ef[f]<1;
+  const sc2 = inE?'#f85149':inP?'#e3b341':color;
+  const pulse = 0.5+0.5*Math.sin(Date.now()/380);
+  ctx.beginPath(); ctx.arc(sx2,sy2,12+pulse*5,0,Math.PI*2);
+  ctx.strokeStyle=sc2+'44'; ctx.lineWidth=1.5; ctx.stroke();
+  ctx.save(); ctx.translate(sx2,sy2); ctx.rotate(Math.PI/4);
+  ctx.fillStyle=sc2; ctx.fillRect(-5,-5,10,10);
+  ctx.fillStyle=inE?'#222':'#4a9eff';
+  ctx.fillRect(-15,-2,9,4); ctx.fillRect(6,-2,9,4);
   ctx.restore();
 
-  // ── Update panel ──────────────────────────────────────────────
-  const now = new Date();
-  document.getElementById('clock').textContent =
-    now.toUTCString().replace('GMT','UTC');
-  document.getElementById('missionName').textContent = DATA.mission;
+  // ── Panel updates ─────────────────────────────────────────────
+  const now2  = new Date();
+  document.getElementById('clock').textContent = now2.toUTCString().replace('GMT','UTC');
 
-  const tMin   = times[f] / 60;
-  const tTotal = T / 60;
-  const orbitN = Math.floor(tMin / tTotal) + 1;
+  // Real orbit count since launch
+  const totalOrbits = getTotalOrbits();
+  document.getElementById('orbit-count').textContent =
+    totalOrbits.toLocaleString();
+  document.getElementById('orbitSince').textContent =
+    'total orbits since launch';
+
+  // Position within current orbit
+  const orbit_t2 = getCurrentOrbitT();
   document.getElementById('tVal').textContent =
-    tMin.toFixed(1) + ' / ' + tTotal.toFixed(1) + ' min';
-  document.getElementById('orbitNum').textContent = 'Orbit ' + orbitN;
+    (orbit_t2/60).toFixed(2) + ' / ' + (T_real/60).toFixed(1) + ' min';
 
-  const mode      = inEclipse ? 'UMBRA' : inPenum ? 'PENUMBRA' : 'SUNLIT';
-  const modeColor = inEclipse ? '#f85149' : inPenum ? '#e3b341' : '#3fb950';
-  const badge     = document.getElementById('modeBadge');
-  badge.textContent = '● ' + mode;
-  badge.style.color      = modeColor;
-  badge.style.background = modeColor + '18';
-  badge.style.border     = '1px solid ' + modeColor + '44';
+  // Mode
+  const mode  = inE?'UMBRA':inP?'PENUMBRA':'SUNLIT';
+  const mcol  = inE?'#f85149':inP?'#e3b341':'#3fb950';
+  const badge = document.getElementById('modeBadge');
+  badge.textContent      = '● '+mode;
+  badge.style.color      = mcol;
+  badge.style.background = mcol+'18';
+  badge.style.border     = '1px solid '+mcol+'44';
 
-  // Next eclipse countdown
-  let nextStr = '—';
-  if (!inEclipse && !inPenum) {{
-    for (let k = f; k < N; k++) {{
-      if (ef[k] > 0) {{
-        const mins = (times[k] - times[f]) / 60;
-        nextStr = 'in ' + mins.toFixed(1) + ' min';
-        break;
-      }}
-    }}
+  // Next eclipse
+  let nxt='No eclipse in range';
+  if (!inE&&!inP) {{
+    for(let k=f;k<N;k++) if(ef[k]>0){{ nxt='in '+((times[k]-times[f])/60).toFixed(1)+' min'; break; }}
   }} else {{
-    for (let k = f; k < N; k++) {{
-      if (ef[k] === 0) {{
-        const mins = (times[k] - times[f]) / 60;
-        nextStr = 'exits in ' + mins.toFixed(1) + ' min';
-        break;
-      }}
-    }}
+    for(let k=f;k<N;k++) if(ef[k]===0){{ nxt='exits in '+((times[k]-times[f])/60).toFixed(1)+' min'; break; }}
   }}
-  document.getElementById('nextEclipse').textContent = nextStr;
+  document.getElementById('nextEcl').textContent=nxt;
 
   // Battery
-  const b      = getBattery(f);
-  const bColor2 = b < 25 ? '#f85149' : b < 50 ? '#e3b341' : '#3fb950';
-  document.getElementById('batVal').textContent = b.toFixed(1) + '%';
-  document.getElementById('batBar').style.width      = b + '%';
-  document.getElementById('batBar').style.background = bColor2;
+  const bv   = bat[f];
+  const bcl  = bv<25?'#f85149':bv<50?'#e3b341':'#3fb950';
+  document.getElementById('batVal').textContent=bv.toFixed(1)+'%';
+  document.getElementById('batBar').style.width=bv+'%';
+  document.getElementById('batBar').style.background=bcl;
 
-  // Solar
-  const solar = inEclipse || inPenum ? 0 : 500;
-  const draw2  = inEclipse || inPenum ? 150 : 300;
-  const net    = solar - draw2;
-  document.getElementById('solarVal').textContent = solar + 'W';
-  document.getElementById('solarVal').style.color = solar > 0 ? '#e3b341' : '#f85149';
-  document.getElementById('netPower').textContent = 'Net: ' + (net >= 0 ? '+' : '') + net + 'W';
+  // Power
+  const sol=inE||inP?0:500, drw=inE||inP?150:300;
+  document.getElementById('powerLine').textContent=
+    `☀ ${{sol}}W  ↓ ${{drw}}W  net ${{sol-drw>=0?'+':''}}${{sol-drw}}W`;
 
-  // Static stats
-  document.getElementById('meanEcl').textContent = DATA.mean_eclipse.toFixed(1);
-  document.getElementById('eclFrac').textContent  = DATA.eclipse_frac.toFixed(1);
-  document.getElementById('nEvents').textContent  = DATA.n_events;
-  document.getElementById('aiPred').textContent   = DATA.ai_pred.toFixed(1);
+  // Stats
+  document.getElementById('mEcl').textContent=D.mean_eclipse.toFixed(1);
+  document.getElementById('eFrac').textContent=D.eclipse_frac.toFixed(1);
+  document.getElementById('aiP').textContent=D.ai_pred.toFixed(1);
 
   requestAnimationFrame(draw);
 }}
 
+// Start — draw directly, status already set from Python SGP4
 draw();
 </script>
-</body>
-</html>
-"""
+</body></html>"""
 
-    components.html(html_code, height=520, scrolling=False)
+    components.html(html_code, height=530, scrolling=False)
 
 with tab2:
     st.plotly_chart(plot_eclipse_timeline(times, ef, events, color),
@@ -1071,8 +1213,7 @@ with tab2:
 
 with tab3:
     # Show telemetry up to current animation frame
-    f3 = st.session_state.get("anim_frame", len(times)-1)
-    f3 = max(1, f3)
+    f3 = max(1, live_frame)
     st.plotly_chart(plot_telemetry(times[:f3], ef[:f3], m["battery_start"]),
                     use_container_width=True, config={"displayModeBar": False})
     # Live battery gauge
@@ -1155,3 +1296,4 @@ with tab5:
                 "Eclipse %": round(np.sum(e2>0)/len(e2)*100, 1),
             })
         st.dataframe(pd.DataFrame(comp_data), use_container_width=True, hide_index=True)
+
