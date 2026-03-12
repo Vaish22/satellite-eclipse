@@ -28,6 +28,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_absolute_error
 import time
 from datetime import datetime, timezone
+from streamlit_autorefresh import st_autorefresh
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -747,10 +748,8 @@ with tab1:
         f = min(f, len(positions) - 1)
         st.session_state.anim_frame = f
 
-        # Auto-refresh every 5 seconds so satellite visibly moves
-        st.markdown("""
-        <meta http-equiv="refresh" content="5">
-        """, unsafe_allow_html=True)
+        # Smooth auto-refresh every 5 seconds — no blink
+        st_autorefresh(interval=5000, limit=None, key="live_refresh")
 
     else:
         # Simulate mode — start from real current position, animate forward
